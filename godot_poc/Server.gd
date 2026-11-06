@@ -1,6 +1,7 @@
 extends Node
 
-# Local HTTP server on port 8080 so cloudflared can forward requests to Postgres
+# Runs only on the host machine to receive HTTP requests from Cloudflare (port 8080)
+# and query the host's PostgreSQL database (port 5432).
 const PORT: int = 8080
 const HOST: String = "127.0.0.1"
 const DB_USER: String = "postgres"
@@ -14,22 +15,24 @@ var server: TCPServer = TCPServer.new()
 var clients: Array[StreamPeerTCP] = []
 var running: bool = false
 
+# Holds active battle sessions in server RAM (player_id -> current battle state)
+# Once a battle finishes, the final result is written to PostgreSQL
+var active_battles: Dictionary = {}
+
 func _ready() -> void:
 	if not db_password.is_empty() and not OS.has_environment("PGPASSWORD"):
 		OS.set_environment("PGPASSWORD", db_password)
 
 	find_psql_path()
-	init_db()
 
 	var err: Error = server.listen(PORT, HOST)
 	if err != OK:
-		print("Port %d already in use (err %d)" % [PORT, err])
+		print("Server port %d already in use (err %d)" % [PORT, err])
 		return
 
 	running = true
 	print("Server listening on http://%s:%d" % [HOST, PORT])
 
-# Find psql.exe if the Windows installer hasn't added it to PATH yet
 func find_psql_path() -> void:
 	for ver in ["17", "16", "15", "14"]:
 		var path: String = "C:/Program Files/PostgreSQL/%s/bin/psql.exe" % ver
@@ -39,25 +42,6 @@ func find_psql_path() -> void:
 	var local_path: String = OS.get_environment("LOCALAPPDATA").path_join("Programs/PostgreSQL/pgsql/bin/psql.exe")
 	if FileAccess.file_exists(local_path):
 		psql_path = local_path
-
-# Make sure the database and player_profile table exist on startup
-func init_db() -> void:
-	var out: Array = []
-	OS.execute(psql_path, ["-U", DB_USER, "-tc", "CREATE DATABASE %s;" % DB_NAME], out, true)
-	var table_sql: String = (
-		"CREATE TABLE IF NOT EXISTS player_profile (" +
-		"player_id VARCHAR(50) PRIMARY KEY, " +
-		"display_name VARCHAR(100) NOT NULL DEFAULT 'commander_fa26', " +
-		"enemies_killed INT NOT NULL DEFAULT 0, " +
-		"battles_won INT NOT NULL DEFAULT 0, " +
-		"games_finished INT NOT NULL DEFAULT 0, " +
-		"flag_first_battle BOOLEAN NOT NULL DEFAULT FALSE, " +
-		"flag_ten_battles BOOLEAN NOT NULL DEFAULT FALSE, " +
-		"flag_game_finished BOOLEAN NOT NULL DEFAULT FALSE, " +
-		"last_action VARCHAR(50) DEFAULT 'INIT', " +
-		"updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);"
-	)
-	run_query(table_sql)
 
 func _process(_delta: float) -> void:
 	if not running:
@@ -103,14 +87,23 @@ func handle_request(client: StreamPeerTCP, raw: String) -> void:
 
 	if method == "GET" and path.begins_with("/profile"):
 		var player_id: String = get_query_param(path, "player_id", DEFAULT_PLAYER)
-		send_response(client, "200 OK", get_profile(player_id))
+		var result: String = get_profile(player_id)
+		if result.begins_with("{\"error\""):
+			send_response(client, "503 Service Unavailable", result)
+		else:
+			send_response(client, "200 OK", result)
 		return
+
 	if method == "POST" and path.begins_with("/profile"):
-		send_response(client, "200 OK", update_profile(body))
+		var result: String = update_profile(body)
+		if result.begins_with("{\"error\""):
+			send_response(client, "503 Service Unavailable", result)
+		else:
+			send_response(client, "200 OK", result)
 		return
+
 	send_response(client, "404 Not Found", "{\"error\":\"Not found\"}")
 
-# Grab query parameter like ?player_id=commander_fa26
 func get_query_param(path: String, key: String, default_val: String) -> String:
 	var q_idx: int = path.find("?")
 	if q_idx == -1:
@@ -126,12 +119,6 @@ func clean_sql(text: String) -> String:
 
 func get_profile(player_id: String) -> String:
 	var safe_id: String = clean_sql(player_id)
-	# Make sure player row exists before reading
-	var seed_sql: String = (
-		"INSERT INTO player_profile (player_id, display_name) " +
-		"VALUES ('%s', '%s') ON CONFLICT (player_id) DO NOTHING;" % [safe_id, safe_id]
-	)
-	run_query(seed_sql)
 	var select_sql: String = (
 		"SELECT row_to_json(t) FROM " +
 		"(SELECT * FROM player_profile WHERE player_id = '%s') t;" % safe_id
@@ -155,7 +142,6 @@ func update_profile(json_body: String) -> String:
 		return res
 	return "{\"ok\":true,\"action\":\"%s\"}" % action
 
-# Build SQL update for each button press and check achievement thresholds
 func get_action_sql(player_id: String, action: String) -> String:
 	match action:
 		"KILL_ENEMY":
@@ -193,7 +179,7 @@ func run_query(sql: String) -> String:
 	var args: PackedStringArray = ["-U", DB_USER, "-d", DB_NAME, "-t", "-A", "-c", sql]
 	var code: int = OS.execute(psql_path, args, output, true)
 	if code != 0 or output.is_empty():
-		var msg: String = str(output[0]).strip_edges() if not output.is_empty() else "psql error"
+		var msg: String = str(output[0]).strip_edges() if not output.is_empty() else "Database unreachable"
 		return "{\"error\":%s}" % JSON.stringify(msg)
 	var text: String = str(output[0]).strip_edges()
 	return text if not text.is_empty() else "{}"

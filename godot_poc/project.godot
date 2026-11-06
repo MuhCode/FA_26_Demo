@@ -14,10 +14,6 @@ config/name="FA_26_Demo"
 run/main_scene="res://ClientUI.tscn"
 config/features=PackedStringArray("4.2", "Forward Plus")
 
-[autoload]
-
-Server="*res://Server.gd"
-
 [display]
 
 window/size/viewport_width=860

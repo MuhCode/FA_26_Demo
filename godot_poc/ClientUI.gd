@@ -19,12 +19,13 @@ var get_req: HTTPRequest
 @onready var achievements_label: Label = %AchievementsLabel
 
 func _ready() -> void:
-	# Set up two HTTP nodes: one for sending updates (POST) and one for reading profile (GET)
 	post_req = HTTPRequest.new()
+	post_req.timeout = 5.0
 	add_child(post_req)
 	post_req.request_completed.connect(_on_post_done)
 
 	get_req = HTTPRequest.new()
+	get_req.timeout = 5.0
 	add_child(get_req)
 	get_req.request_completed.connect(_on_get_done)
 
@@ -37,11 +38,16 @@ func _ready() -> void:
 	reset_btn.pressed.connect(func() -> void: send_action("RESET"))
 	refresh_btn.pressed.connect(fetch_profile)
 
-	# Pull current stats from Postgres on launch
+	# Initial connection check on launch
+	status_label.text = "Status: Connection to database initializing..."
 	fetch_profile()
 
 func send_action(action_name: String) -> void:
 	var base_url: String = url_input.text.strip_edges().trim_suffix("/")
+	if base_url.is_empty():
+		status_label.text = "Status: No server URL entered"
+		return
+
 	var body: Dictionary = {
 		"player_id": player_input.text.strip_edges(),
 		"action": action_name
@@ -49,37 +55,66 @@ func send_action(action_name: String) -> void:
 	var headers: PackedStringArray = ["Content-Type: application/json"]
 	status_label.text = "Status: Sending %s..." % action_name
 	post_req.cancel_request()
-	post_req.request(base_url + "/profile", headers, HTTPClient.METHOD_POST, JSON.stringify(body))
+	var err: Error = post_req.request(base_url + "/profile", headers, HTTPClient.METHOD_POST, JSON.stringify(body))
+	if err != OK:
+		status_label.text = "Status: Invalid URL or request failed"
 
 func fetch_profile() -> void:
 	var base_url: String = url_input.text.strip_edges().trim_suffix("/")
+	if base_url.is_empty():
+		status_label.text = "Status: No server URL entered"
+		return
+
 	var player_id: String = player_input.text.strip_edges().uri_encode()
-	status_label.text = "Status: Loading profile..."
+	status_label.text = "Status: Connection to database initializing..."
 	get_req.cancel_request()
-	get_req.request(base_url + "/profile?player_id=" + player_id, [], HTTPClient.METHOD_GET)
+	var err: Error = get_req.request(base_url + "/profile?player_id=" + player_id, [], HTTPClient.METHOD_GET)
+	if err != OK:
+		status_label.text = "Status: Invalid URL or request failed"
 
-func _on_post_done(_result: int, code: int, _headers: PackedStringArray, body: PackedByteArray) -> void:
-	if code == 200:
-		status_label.text = "Status: Saved to DB"
-	else:
-		status_label.text = "Status: Error (%d) %s" % [code, body.get_string_from_utf8()]
+func _on_post_done(result: int, code: int, _headers: PackedStringArray, _body: PackedByteArray) -> void:
+	if result != HTTPRequest.RESULT_SUCCESS or code != 200:
+		status_label.text = get_connection_error(result, code)
+		return
 
+	status_label.text = "Status: Connected (Saved to DB)"
 	if auto_refresh.button_pressed:
 		fetch_profile()
 
-func _on_get_done(_result: int, code: int, _headers: PackedStringArray, body: PackedByteArray) -> void:
-	var text: String = body.get_string_from_utf8()
-	if code != 200:
-		status_label.text = "Status: Failed to load (%d)" % code
+func _on_get_done(result: int, code: int, _headers: PackedStringArray, body: PackedByteArray) -> void:
+	if result != HTTPRequest.RESULT_SUCCESS or code != 200:
+		status_label.text = get_connection_error(result, code)
 		return
 
+	var text: String = body.get_string_from_utf8()
 	var parsed: Variant = JSON.parse_string(text)
 	if typeof(parsed) != TYPE_DICTIONARY or parsed.has("error"):
-		status_label.text = "Status: DB error"
+		status_label.text = "Status: Database offline or profile not initialized"
 		return
 
-	status_label.text = "Status: Profile synced"
+	status_label.text = "Status: Connected to database"
 	update_ui(parsed)
+
+# Detect whether Cloudflare, the Godot Server, or PostgreSQL is offline
+func get_connection_error(result: int, code: int) -> String:
+	var current_url: String = url_input.text.to_lower()
+	var using_cloudflare: bool = current_url.contains("trycloudflare.com") or current_url.begins_with("https://")
+
+	# Network-level failure (couldn't reach host or DNS failed)
+	if result == HTTPRequest.RESULT_CANT_RESOLVE:
+		return "Status: Cloudflare offline (tunnel link not active)" if using_cloudflare else "Status: Server offline (cannot resolve host)"
+	if result == HTTPRequest.RESULT_CANT_CONNECT or result == HTTPRequest.RESULT_CONNECTION_ERROR or result == HTTPRequest.RESULT_TIMEOUT:
+		return "Status: Cloudflare offline (cannot reach tunnel)" if using_cloudflare else "Status: Server offline (port 8080 not running)"
+
+	# HTTP error codes returned by Cloudflare or the Server
+	if code == 530 or code == 1033:
+		return "Status: Cloudflare offline (cloudflared tunnel stopped)"
+	if code == 502 or code == 504:
+		return "Status: Server offline (Cloudflare is up, but Server on 8080 is off)"
+	if code == 503:
+		return "Status: Database offline (Server is up, but PostgreSQL is off)"
+
+	return "Status: Server offline (HTTP %d)" % code
 
 func update_ui(data: Dictionary) -> void:
 	stats_label.text = (

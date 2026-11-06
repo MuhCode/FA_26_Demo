@@ -1,0 +1,14 @@
+# Cloudflare Tunnel Configuration (FA_26_Demo)
+# Routes public HTTPS & WebSocket traffic from Cloudflare Edge to the local Godot Server on port 8080
+
+url: http://127.0.0.1:8080
+protocol: quic
+loglevel: debug
+
+originRequest:
+  connectTimeout: 10s
+  tlsTimeout: 10s
+  tcpKeepAlive: 30s
+  noHappyEyeballs: false
+  keepAliveConnections: 100
+  keepAliveTimeout: 90s
